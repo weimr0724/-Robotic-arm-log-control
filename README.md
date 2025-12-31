@@ -71,3 +71,8 @@ The validation notebook reads the latest `logs/run_*.csv` and plots:
 - Joint tracking error vs time
 - Target vs actual joint angles
 
+- Example output:
+- Validation executed successfully with zero tracking error under ideal conditions
+- Confirms correctness of logging and validation pipeline
+
+
