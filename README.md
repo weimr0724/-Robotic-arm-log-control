@@ -58,3 +58,16 @@ This prevents unsafe motions caused by sensor noise, sudden input changes, or co
 ## Project Status
 This project is under active development.
 Future improvements may include additional degrees of freedom, sensor fusion, and higher-level control strategies.
+
+
+## Validation (Closed-Loop Verification)
+This project includes a data-driven validation loop using runtime logs.
+
+- Notebook: `notebooks/4_INDUSTRIAL_DT.ipynb`
+- Purpose: Compare **Target vs Actual** joint angles and visualize tracking error over time
+- Data Source: CSV logs generated during control runs (saved under `logs/`)
+
+The validation notebook reads the latest `logs/run_*.csv` and plots:
+- Joint tracking error vs time
+- Target vs actual joint angles
+
