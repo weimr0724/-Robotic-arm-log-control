@@ -1,6 +1,11 @@
 import os, sys, time, json, csv
 import numpy as np
 
+from .utils import load_calibration, save_calibration, DEFAULT_CAL, CAL_PATH
+from .serial_io import send_T, parse_feedback_line
+from .ui_kinematics import CameraPanel, Button, RunLogger, fk_points_side, draw_virtual_robot
+
+
 # ---------- Optional libs ----------
 HAS_SERIAL = True
 try:
@@ -69,223 +74,6 @@ DEFAULT_CAL = {
 CAL_PATH = "calibration.json"
 
 
-# =========================
-# Utility
-# =========================
-def clamp(v, lo=0, hi=180):
-    try:
-        v = int(round(v))
-    except Exception:
-        v = int(v)
-    return max(lo, min(hi, v))
-
-def safe_mkdir(p):
-    try:
-        os.makedirs(p, exist_ok=True)
-    except Exception:
-        pass
-
-def load_calibration(path=CAL_PATH):
-    cfg = json.loads(json.dumps(DEFAULT_CAL))
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                u = json.load(f)
-            # shallow merge
-            for k in cfg:
-                if k in u and isinstance(u[k], dict):
-                    cfg[k].update(u[k])
-                elif k in u:
-                    cfg[k] = u[k]
-        except Exception:
-            pass
-    return cfg
-
-def save_calibration(cfg, path=CAL_PATH):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-        return True
-    except Exception:
-        return False
-
-def send_T(ser, a1, a2, a3):
-    if ser is None:
-        return
-    msg = f"T,{clamp(a1)},{clamp(a2)},{clamp(a3)}\n"
-    try:
-        ser.write(msg.encode("utf-8"))
-    except Exception:
-        pass
-
-def parse_feedback_line(line: str):
-    # Expected: "A,90,90,90,OK"
-    line = line.strip()
-    if not line.startswith("A,"):
-        return None
-    parts = line.split(",")
-    if len(parts) < 5:
-        return None
-    try:
-        a1 = int(parts[1]); a2 = int(parts[2]); a3 = int(parts[3])
-        st = parts[4].strip()
-        return (a1, a2, a3, st)
-    except Exception:
-        return None
-
-
-# =========================
-# Camera Panel + Motion/Marker
-# =========================
-class CameraPanel:
-    def __init__(self, w, h, fps_limit=25, candidates=None):
-        self.w, self.h = int(w), int(h)
-        self.fps_limit = max(1, int(fps_limit))
-        self.candidates = candidates or [0]
-        self.cap = None
-        self.ok = False
-        self.last_frame = None   # pygame surface (rotated)
-        self.raw_bgr = None      # bgr for cv
-        self.last_grab = 0.0
-
-        self.prev_gray = None
-        self.motion_center = None   # (cx, cy) original coord
-        self.marker_center = None   # (cx, cy) original coord
-
-        if ENABLE_CAMERA and HAS_CV2:
-            self._open_first_available()
-
-    def _open_first_available(self):
-        for idx in self.candidates:
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if cap is not None and cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.w)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.h)
-                self.cap = cap
-                self.ok = True
-                return
-        self.ok = False
-        self.cap = None
-
-    def close(self):
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-        self.cap = None
-        self.ok = False
-
-    def update(self):
-        if (not ENABLE_CAMERA) or (not HAS_CV2) or (not self.ok) or (self.cap is None):
-            return
-
-        now = time.time()
-        if now - self.last_grab < (1 / self.fps_limit):
-            return
-        self.last_grab = now
-
-        ret, frame = self.cap.read()
-        if not ret or frame is None:
-            self.ok = False
-            return
-
-        frame = cv2.resize(frame, (self.w, self.h), interpolation=cv2.INTER_AREA)
-        self.raw_bgr = frame.copy()
-
-        # ---- for pygame display (RGB + rot90) ----
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb_r = np.rot90(rgb)
-        self.last_frame = pygame.surfarray.make_surface(rgb_r)
-
-        # ---- compute motion center ----
-        self.motion_center = self._motion_center(frame)
-
-        # ---- compute marker center ----
-        self.marker_center = self._marker_center(rgb)
-
-    def _motion_center(self, bgr):
-        # downscale
-        if MOTION_DOWNSCALE != 1.0:
-            small = cv2.resize(bgr, (0, 0), fx=MOTION_DOWNSCALE, fy=MOTION_DOWNSCALE, interpolation=cv2.INTER_AREA)
-        else:
-            small = bgr
-
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (7, 7), 0)
-
-        if self.prev_gray is None:
-            self.prev_gray = gray
-            return None
-
-        diff = cv2.absdiff(self.prev_gray, gray)
-        self.prev_gray = gray
-
-        _, th = cv2.threshold(diff, MOTION_DIFF_THRESH, 255, cv2.THRESH_BINARY)
-        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
-
-        cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            return None
-
-        c = max(cnts, key=cv2.contourArea)
-        area = cv2.contourArea(c)
-        if area < MOTION_MIN_AREA:
-            return None
-
-        M = cv2.moments(c)
-        if M["m00"] == 0:
-            return None
-
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-
-        # back to original scale
-        if MOTION_DOWNSCALE != 1.0:
-            cx = int(cx / MOTION_DOWNSCALE)
-            cy = int(cy / MOTION_DOWNSCALE)
-
-        return (cx, cy)
-
-    def _marker_center(self, rgb):
-        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-
-        if TRACK_COLOR == "green":
-            lower = np.array([35, 80, 80])
-            upper = np.array([85, 255, 255])
-            mask = cv2.inRange(hsv, lower, upper)
-        elif TRACK_COLOR == "red":
-            lower1 = np.array([0, 80, 80]);   upper1 = np.array([10, 255, 255])
-            lower2 = np.array([170, 80, 80]); upper2 = np.array([180, 255, 255])
-            mask1 = cv2.inRange(hsv, lower1, upper1)
-            mask2 = cv2.inRange(hsv, lower2, upper2)
-            mask = cv2.bitwise_or(mask1, mask2)
-        else:
-            return None
-
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
-
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            return None
-
-        c = max(cnts, key=cv2.contourArea)
-        area = cv2.contourArea(c)
-        if area < 180:
-            return None
-
-        M = cv2.moments(c)
-        if M["m00"] == 0:
-            return None
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        return (cx, cy)
-
-def rot90_coord(cx, cy, w, h):
-    # np.rot90 CCW: x' = cy, y' = (w - 1 - cx)
-    return (cy, (w - 1 - cx))
 
 
 # =========================
@@ -396,55 +184,6 @@ def draw_virtual_robot(screen, x, y, w, h, angles_actual, cal, view_mode, ee_tra
     screen.blit(mono.render(f"ACTUAL(raw)={tuple(angles_actual)}", True, (200,200,200)), (x+12, y+h-56))
     screen.blit(mono.render(f"VISUAL(map)=({int(a1v)},{int(a2v)},{int(a3v)})", True, (160,160,160)), (x+12, y+h-32))
     return (float(p3[0]), float(p3[1]))
-
-
-# =========================
-# CSV Logger
-# =========================
-class RunLogger:
-    def __init__(self):
-        safe_mkdir(LOG_DIR)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        self.path = os.path.join(LOG_DIR, f"run_{ts}.csv")
-        self.f = open(self.path, "w", newline="", encoding="utf-8")
-        self.w = csv.writer(self.f)
-        self.w.writerow([
-            "t","strategy","source","mode",
-            "target_a1","target_a2","target_a3",
-            "actual_a1","actual_a2","actual_a3",
-            "err_a1","err_a2","err_a3",
-            "dx","dy"
-        ])
-        self.flush_every = 30   # 每30行强制写盘一次
-        self.n = 0
-        self.f.flush()
-
-    def log(self, strategy, source, mode, target, actual, dx, dy):
-        t = int(time.time())
-        err = (target[0]-actual[0], target[1]-actual[1], target[2]-actual[2])
-        self.w.writerow([
-            t, strategy, source, mode,
-            target[0], target[1], target[2],
-            actual[0], actual[1], actual[2],
-            err[0], err[1], err[2],
-            dx, dy
-        ])
-        self.n += 1
-        if self.n % self.flush_every == 0:
-            try:
-                self.f.flush()
-            except Exception:
-                pass
-
-    def close(self):
-        try:
-            self.f.flush()
-        except Exception:
-            pass
-        try:
-            self.f.close()
-        except Exception:
-            pass
 
 
 # =========================
@@ -770,3 +509,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
