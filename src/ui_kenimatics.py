@@ -3,6 +3,18 @@ import pygame
 
 from .utils import safe_mkdir
 
+
+# ===== UI / Camera settings =====
+# Set to False to run without any camera dependency.
+ENABLE_CAMERA = False
+
+# OpenCV availability flag (used by CameraPanel). If you do not need camera, keep False.
+HAS_CV2 = False
+
+# Directory used to store runtime CSV logs.
+LOG_DIR = "logs"
+
+
 # =========================
 # Camera Panel + Motion/Marker
 # =========================
