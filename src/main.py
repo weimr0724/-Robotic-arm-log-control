@@ -2,8 +2,12 @@ import os, sys, time, json, csv
 import numpy as np
 
 from .utils import load_calibration, save_calibration, DEFAULT_CAL, CAL_PATH
-from .serial_io import send_T, parse_feedback_line
-from .ui_kinematics import CameraPanel, Button, RunLogger, fk_points_side, draw_virtual_robot
+from .Serial_IO import send_T, parse_feedback_line
+from .ui_kinematics import CameraPanel, RunLogger, fk_points_side, draw_virtual_robot
+
+
+Button = CameraPanel.Button
+
 
 
 # ---------- Optional libs ----------
